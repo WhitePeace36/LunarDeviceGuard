@@ -1,7 +1,7 @@
 # Maintainer: Timon <timon2201@gmail.com>
 pkgname=devguard
-pkgver=0.1.0
-pkgrel=2
+pkgver=0.3.0
+pkgrel=1
 pkgdesc="Contain misbehaving hardware: IRQ storms, PCIe AER floods, USB reconnect loops, kernel log floods"
 arch=('any')
 url="https://github.com/WhitePeace36/LunarDeviceGuard"

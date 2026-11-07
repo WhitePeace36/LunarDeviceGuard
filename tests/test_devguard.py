@@ -437,6 +437,80 @@ def test_kmsg_proc_fallback():
     os.remove(ROOT + "/proc/kmsg")
 
 
+def snap(t, psi=None, vm=None, irq=None, smi=None):
+    s = dg.Snapshot.__new__(dg.Snapshot)
+    s.t, s.wall = t, 1e9 + t
+    base = {k: 0 for k in ("cpu some", "memory some", "memory full", "io some", "io full", "irq full")}
+    base.update(psi or {})
+    s.psi = base
+    s.vm = dict.fromkeys(dg.VMSTAT_KEYS, 0)
+    s.vm.update(vm or {})
+    s.irq = irq or {"LOC": (0, "Local timer interrupts")}
+    s.smi = smi
+    return s
+
+
+def test_freeze_explain():
+    print("freeze classification")
+    a = snap(0.0)
+    v, _ = dg.explain(a, snap(0.08, psi={"memory some": 60000, "memory full": 55000},
+                               vm={"allocstall": 2, "compact_stall": 1}), 80)
+    check(v.startswith("MEMORY"), "reclaim/compaction stall -> MEMORY")
+    v, lines = dg.explain(snap(0.0, irq={"87": (0, "xhci_hcd")}),
+                          snap(0.1, psi={"irq full": 60000}, irq={"87": (9000, "xhci_hcd")}), 100)
+    check(v.startswith("INTERRUPTS") and "87" in v, "irq pressure -> INTERRUPTS with the busiest line")
+    check("87 90000/s" in lines[-1], "interrupt rate over the window")
+    v, _ = dg.explain(a, snap(0.2, psi={"io some": 150000}, vm={"pgmajfault": 40}), 200)
+    check(v.startswith("I/O") and "major faults" in v, "io pressure + major faults -> I/O")
+    v, _ = dg.explain(a, snap(0.1, psi={"cpu some": 90000}), 100)
+    check(v.startswith("CPU"), "cpu pressure -> CPU")
+    v, _ = dg.explain(a, snap(0.1), 100)
+    check(v.startswith("UNACCOUNTED") and "not countable" in v, "no pressure at all -> UNACCOUNTED (SMI / irqs off)")
+    v, lines = dg.explain(snap(0.0, smi=1000), snap(0.1, smi=1003), 100)
+    check(v.startswith("FIRMWARE: 3 SMI") and any("SMIs (firmware interrupts): 3" in l for l in lines),
+          "SMIs during the window -> FIRMWARE")
+    v, _ = dg.explain(snap(0.0, smi=5), snap(0.1, smi=5), 100)
+    check(v.startswith("UNACCOUNTED") and "not countable" not in v, "SMI counter on but no SMIs -> UNACCOUNTED")
+
+
+def test_check():
+    print("devguard check")
+    put("/proc/cpuinfo", "vendor_id\t: AuthenticAMD\nmodel name\t: AMD Ryzen 9 5950X 16-Core Processor\n")
+    put("/sys/class/dmi/id/board_vendor", "ASUSTeK COMPUTER INC.\n")
+    put("/sys/class/dmi/id/board_name", "ROG STRIX B550-F GAMING\n")
+    put("/sys/class/dmi/id/bios_version", "2006\n")
+    put("/sys/class/dmi/id/bios_date", "03/19/2021\n")
+    put("/proc/sys/kernel/osrelease", "7.3.3-273-tkg-eevdf-llvm\n")
+    os.makedirs(ROOT + "/sys/bus/platform/drivers/tpm_crb", exist_ok=True)
+    os.makedirs(ROOT + "/sys/devices/platform/MSFT0101:00", exist_ok=True)
+    os.makedirs(ROOT + "/sys/class/tpm/tpm0", exist_ok=True)
+    if not os.path.exists(ROOT + "/sys/devices/platform/MSFT0101:00/driver"):
+        os.symlink(ROOT + "/sys/bus/platform/drivers/tpm_crb", ROOT + "/sys/devices/platform/MSFT0101:00/driver")
+        os.symlink(ROOT + "/sys/devices/platform/MSFT0101:00", ROOT + "/sys/class/tpm/tpm0/device")
+    put("/sys/class/misc/hw_random/rng_current", "tpm-rng-0\n")
+    put("/sys/devices/system/clocksource/clocksource0/current_clocksource", "hpet\n")
+    put("/sys/devices/system/cpu/online", "0-3\n")
+    log = ("[    1.0] clocksource: timekeeping watchdog on CPU3: Marking clocksource 'tsc' as unstable because the skew is too large\n"
+           "[    1.1] clocksource: Switched to clocksource hpet\n"
+           "[  300.0] usb 3-2: device descriptor read/64, error -71\n"
+           "[  400.0] amdgpu 0000:03:00.0: amdgpu: ring gfx_0.0.0 timeout\n")
+    old = dg.kernel_log
+    dg.kernel_log = lambda: log
+    try:
+        out = captured(dg.check)
+    finally:
+        dg.kernel_log = old
+    check("Ryzen 9 5950X" in out and "ROG STRIX B550-F" in out and "2006 03/19/2021" in out, "CPU, board and BIOS shown")
+    check("most likely AMD's firmware TPM" in out, "AMD fTPM recognised (AMD CPU + tpm_crb)")
+    check("tpm-rng-0: the kernel reads randomness from the TPM" in out, "TPM as random source flagged")
+    check("hpet: not tsc" in out, "non-TSC clocksource flagged")
+    check("log: clocksource" in out and "2x since boot" in out, "clocksource messages counted")
+    check("log: USB problems" in out and "error -71" in out, "USB errors found in the log")
+    check("log: GPU errors" in out and "ring gfx" in out, "GPU timeout found in the log")
+    check("SMIs" in out, "SMI line present")
+    check("worth a look" in out, "summary counts the findings")
+
+
 def test_run_loop():
     print("service loop")
     reset_state()
@@ -490,6 +564,8 @@ if __name__ == "__main__":
         test_usb()
         test_kmsg()
         test_kmsg_proc_fallback()
+        test_freeze_explain()
+        test_check()
         test_run_loop()
         test_config()
     finally:

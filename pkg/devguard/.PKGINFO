@@ -3,12 +3,12 @@
 pkgname = devguard
 pkgbase = devguard
 xdata = pkgtype=pkg
-pkgver = 0.1.0-2
+pkgver = 0.3.0-1
 pkgdesc = Contain misbehaving hardware: IRQ storms, PCIe AER floods, USB reconnect loops, kernel log floods
 url = https://github.com/WhitePeace36/LunarDeviceGuard
-builddate = 1794078617
+builddate = 1794090500
 packager = Unknown Packager
-size = 35050
+size = 53541
 arch = any
 license = GPL-2.0-only
 backup = etc/devguard.toml

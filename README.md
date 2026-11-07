@@ -50,6 +50,62 @@ To see what's going on right now without the service:
 sudo devguard scan --seconds 60      # observe for a minute, print findings
 ```
 
+## Known causes of stutters: `devguard check`
+
+```bash
+sudo devguard check
+```
+
+One pass over things that are known to make a whole system stutter, as a
+checklist (`!` = worth a look):
+
+- CPU, board and BIOS version: many firmware stalls are fixed by BIOS updates
+- **AMD firmware TPM (fTPM)**: on many Ryzen boards with older AGESA it stalls
+  the whole system; flagged when an AMD CPU uses the `tpm_crb` TPM, and
+  especially when the kernel reads randomness from it (`tpm-rng-0`)
+- clocksource: anything other than `tsc` makes timekeeping slow
+- SMIs (firmware interrupts) counted for 2 s (AMD: PMU event `ls_smi_rx`;
+  Intel: MSR 0x34, needs `modprobe msr`; not available in VMs)
+- the kernel log since boot: clocksource problems, long interrupt handlers,
+  lockups, switched-off IRQs, PCIe/hardware errors, USB resets and
+  disconnects, disk errors, GPU timeouts, TPM errors, thermal throttling
+
+## Short freezes (tens of milliseconds)
+
+The guards above react to problems that last seconds. For short freezes
+(the picture stops, keystrokes get lost, then everything jumps ahead) use:
+
+```bash
+sudo devguard freeze                 # until Ctrl+C
+sudo devguard freeze --threshold 20  # report stalls > 20 ms (default 30)
+```
+
+A normal-priority loop checks every 5 ms whether it was held up. After every
+freeze it prints how long it was and what the kernel recorded in that moment:
+
+```
+21:06:47.910  FREEZE 407 ms (this watcher was held up)
+   -> MEMORY: tasks stalled in reclaim/compaction (allocstall/compact_stall); ...
+   psi (ms stalled in this window): memory some 380  memory full 350  io some 0 ...
+   vmstat: allocstall +4, compact_stall +2
+   SMIs (firmware interrupts): 0
+   busiest interrupts: LOC 18000/s, 87 2500/s (... xhci_hcd), ...
+   kernel: <any kernel message from that moment>
+```
+
+| Verdict | Meaning |
+| --- | --- |
+| MEMORY | tasks were stuck in memory reclaim/compaction |
+| INTERRUPTS | CPUs were busy in interrupt handlers (busiest line shown) |
+| I/O | tasks waited for the disk, e.g. for pages read back from swap |
+| CPU | runnable tasks waited for a CPU |
+| FIRMWARE | SMIs were counted during the freeze: the firmware stopped the system |
+| UNACCOUNTED | the kernel recorded no pressure at all: typical for firmware (SMI, if they can't be counted) or a driver keeping interrupts off; lost keystrokes point the same way |
+
+If you see a freeze but devguard prints nothing, press Enter: it then shows
+the last 3 seconds. No stall of the watcher means the CPU side ran normally
+and the freeze was in the GPU/display path.
+
 ## Undo
 
 Every change is recorded in `/run/devguard/state.json` (cleared at reboot):
@@ -77,4 +133,4 @@ Or set `revert_on_exit = true` to undo everything when the service stops.
 
 `python3 tests/test_devguard.py` runs devguard against fake `/proc` and `/sys`
 trees with simulated storms, error floods, reconnect loops and log floods
-(43 checks, no root needed).
+(60 checks, no root needed).

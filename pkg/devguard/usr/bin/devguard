@@ -23,6 +23,12 @@ Usage:
   devguard revert                                      undo recorded actions
   devguard scan [--seconds N]                          observe for N seconds,
                                                        print findings, exit
+  devguard check                                       look for known causes
+                                                       of stutters (fTPM,
+                                                       clocksource, SMIs, log)
+  devguard freeze [--threshold MS] [--seconds N]       catch short freezes
+                                                       (tens of ms) and show
+                                                       what the kernel saw
 """
 
 import argparse
@@ -678,6 +684,7 @@ class KmsgGuard:
         self.quieted = False
         self.partial = ""
         self.findings = []
+        self.recent = collections.deque(maxlen=200)  # (monotonic time, message)
         self.source = None
         # /dev/kmsg is refused, even to root, when kernel.printk_devkmsg is
         # "off" (or printk.devkmsg=off on the command line). /proc/kmsg, the
@@ -741,6 +748,7 @@ class KmsgGuard:
                 else:
                     msg = PROC_KMSG_PREFIX.sub("", line)
                 self.top[NUMBER.sub("#", msg)[:70]] += 1
+                self.recent.append((time.monotonic(), msg[:200]))
 
     def tick(self, dt):
         if dt <= 0:
@@ -769,6 +777,392 @@ class KmsgGuard:
 
 
 # --------------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------------
+# SMI counter: System Management Interrupts are handled by the firmware and
+# stop the whole machine without the kernel seeing them. AMD Zen counts them
+# in the PMU event ls_smi_rx (0x2B), Intel in MSR_SMI_COUNT (0x34).
+
+class SmiCounter:
+    PERF_TYPE_RAW = 4
+    AMD_LS_SMI_RX = 0x2B
+    INTEL_MSR_SMI_COUNT = 0x34
+
+    def __init__(self, event=None):
+        """event: (perf type, config) to override the CPU-specific choice (tests)."""
+        self.fds, self.msr, self.why = [], [], ""
+        vendor = ""
+        for line in (read("/proc/cpuinfo") or "").splitlines():
+            if line.startswith("vendor_id"):
+                vendor = line.split(":", 1)[1].strip()
+                break
+        cpus = sorted(parse_cpulist(read("/sys/devices/system/cpu/online") or "0"))
+        if event is None and vendor == "GenuineIntel":
+            for c in cpus:
+                try:
+                    self.msr.append(os.open(path(f"/dev/cpu/{c}/msr"), os.O_RDONLY))
+                except OSError as e:
+                    self.close()
+                    self.why = ("needs the msr module: sudo modprobe msr" if e.errno == errno.ENOENT
+                                else f"/dev/cpu/*/msr: {e.strerror}")
+                    return
+            return
+        if event is None and vendor != "AuthenticAMD":
+            self.why = f"unknown CPU vendor {vendor or '?'}"
+            return
+        ptype, config = event or (self.PERF_TYPE_RAW, self.AMD_LS_SMI_RX)
+        try:
+            import ctypes
+            libc = ctypes.CDLL(None, use_errno=True)
+        except OSError as e:
+            self.why = str(e)
+            return
+        # struct perf_event_attr, PERF_ATTR_SIZE_VER0 (64 bytes)
+        attr = bytearray(64)
+        attr[0:4] = ptype.to_bytes(4, "little")
+        attr[4:8] = (64).to_bytes(4, "little")
+        attr[8:16] = config.to_bytes(8, "little")
+        buf = (ctypes.c_char * 64).from_buffer(attr)
+        for c in cpus:
+            fd = libc.syscall(298, buf, -1, c, -1, 0)  # perf_event_open, x86_64
+            if fd < 0:
+                err = ctypes.get_errno()
+                self.close()
+                self.why = f"perf_event_open: {os.strerror(err)}" + (
+                    " (no hardware PMU, e.g. in a VM)" if err == errno.ENOENT else "")
+                return
+            self.fds.append(fd)
+
+    @property
+    def available(self):
+        return bool(self.fds or self.msr)
+
+    def read(self):
+        total = 0
+        try:
+            for fd in self.fds:
+                total += int.from_bytes(os.read(fd, 8), "little")
+            for fd in self.msr:
+                total += int.from_bytes(os.pread(fd, 8, self.INTEL_MSR_SMI_COUNT), "little")
+        except OSError:
+            return None
+        return total
+
+    def close(self):
+        for fd in self.fds + self.msr:
+            os.close(fd)
+        self.fds, self.msr = [], []
+
+
+# --------------------------------------------------------------------------
+# devguard check: one pass over known causes of system-wide stutters.
+
+KLOG_PATTERNS = (
+    ("clocksource", r"clocksource.*(unstable|skew|switched to clocksource (hpet|acpi_pm))|Marking clocksource",
+     "the TSC was found unreliable; slower clocksources make timekeeping expensive"),
+    ("long interrupts", r"perf: interrupt took too long|NMI handler .* took too long",
+     "an interrupt handler ran for a long time"),
+    ("lockups / stalls", r"soft lockup|hard LOCKUP|rcu.*(stall|self-detected)|blocked for more than \d+ seconds",
+     "a CPU or task was stuck in the kernel"),
+    ("unhandled IRQs", r"nobody cared|Disabling IRQ #", "an interrupt line was switched off by the kernel"),
+    ("PCIe errors", r"AER:|PCIe Bus Error", "PCIe link errors (see devguard's AER handling)"),
+    ("hardware errors", r"mce:|Machine check|Hardware Error", "the CPU reported hardware errors"),
+    ("USB problems", r"usb .*(reset|error -\d+|device descriptor read|not accepting address)|xHCI.*(not responding|died|halt)",
+     "USB devices resetting or failing"),
+    ("USB disconnects", r"USB disconnect", "devices dropping off the bus"),
+    ("storage errors", r"ata\d+.*(error|hard resetting|timeout|failed)|nvme.*(timeout|reset|abort)|I/O error|blk_update_request",
+     "disk or controller errors"),
+    ("GPU errors", r"amdgpu.*(timeout|reset|fault|ERROR)|flip_done timed out|i915.*(hang|reset)|nouveau.*(fault|timeout)|nvidia.*Xid",
+     "graphics driver timeouts or resets"),
+    ("TPM", r"\btpm\b.*(error|timeout|fail|defective)|tpm_crb.*(error|fail)", "firmware TPM problems"),
+    ("thermal", r"throttl|temperature above threshold|thermal.*critical", "CPU or GPU throttling"),
+)
+
+
+def kernel_log():
+    import subprocess
+    try:
+        return subprocess.run(["dmesg"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def check():
+    rows = []
+
+    def row(mark, what, text):
+        rows.append((mark, what, text))
+
+    def first(*files):
+        for f in files:
+            v = read(f)
+            if v and v.strip():
+                return v.strip()
+        return None
+
+    cpu = vendor = "?"
+    for line in (read("/proc/cpuinfo") or "").splitlines():
+        if line.startswith("model name") and cpu == "?":
+            cpu = line.split(":", 1)[1].strip()
+        if line.startswith("vendor_id") and vendor == "?":
+            vendor = line.split(":", 1)[1].strip()
+    row("info", "CPU", cpu)
+    board = " ".join(x for x in (first("/sys/class/dmi/id/board_vendor"), first("/sys/class/dmi/id/board_name")) if x)
+    bios = " ".join(x for x in (first("/sys/class/dmi/id/bios_version"), first("/sys/class/dmi/id/bios_date")) if x)
+    row("info", "Board / BIOS", f"{board or '?'} / {bios or '?'} (old BIOSes cause many firmware stalls)")
+    row("info", "Kernel", (read("/proc/sys/kernel/osrelease") or "?").strip())
+
+    # TPM: AMD's firmware TPM stalls the whole system on many Ryzen BIOSes
+    tpm = os.path.isdir(path("/sys/class/tpm/tpm0"))
+    drv = os.path.basename(os.path.realpath(path("/sys/class/tpm/tpm0/device/driver"))) if tpm else ""
+    rng = (read("/sys/class/misc/hw_random/rng_current") or "").strip()
+    ftpm = tpm and vendor == "AuthenticAMD" and drv == "tpm_crb"
+    if not tpm:
+        row("ok", "TPM", "none")
+    else:
+        row("!" if ftpm else "info", "TPM",
+            f"present (driver {drv or '?'})" + (": most likely AMD's firmware TPM (fTPM), known to "
+            "stall Ryzen systems on older AGESA; a BIOS update fixes it" if ftpm else ""))
+    if rng.startswith("tpm"):
+        row("!", "Random source", f"{rng}: the kernel reads randomness from the TPM; with an AMD fTPM "
+            "each read can stall the system")
+    elif rng:
+        row("ok", "Random source", rng)
+
+    cs = (read("/sys/devices/system/clocksource/clocksource0/current_clocksource") or "").strip()
+    row("ok" if cs in ("tsc", "kvm-clock") else "!", "Clocksource",
+        cs + ("" if cs in ("tsc", "kvm-clock") else ": not tsc, timekeeping is slow (look for 'clocksource' below)"))
+
+    drvf = (read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_driver") or "").strip()
+    gov = (read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor") or "").strip()
+    pst = (read("/sys/devices/system/cpu/amd_pstate/status") or "").strip()
+    if drvf:
+        row("info", "CPU frequency", f"{drvf}{' (' + pst + ')' if pst else ''}, governor {gov or '?'}")
+
+    smi = SmiCounter()
+    if smi.available:
+        a = smi.read()
+        time.sleep(2)
+        b = smi.read()
+        n = (b - a) if a is not None and b is not None else None
+        row("!" if n else "ok", "SMIs (2 s)", f"{n} firmware interrupts" + (
+            ": the firmware interrupted the system; use 'devguard freeze' to see if they line up with freezes"
+            if n else "") if n is not None else "could not read")
+        smi.close()
+    else:
+        row("?", "SMIs", f"not countable here ({smi.why})")
+
+    psi_irq = os.path.exists(path("/proc/pressure/irq"))
+    row("ok" if psi_irq else "info", "IRQ time accounting",
+        "on" if psi_irq else "off (CONFIG_IRQ_TIME_ACCOUNTING): interrupt CPU time is only estimated")
+    if os.path.exists(path("/run/systemd/units/invocation:irqbalance.service")) or \
+            os.path.exists(path("/run/irqbalance")):
+        row("info", "irqbalance", "running: it may move IRQs that devguard confined back")
+
+    log = kernel_log()
+    if not log:
+        row("?", "Kernel log", "could not read (run with sudo)")
+    for name, rx, meaning in KLOG_PATTERNS:
+        hits = [l for l in log.splitlines() if re.search(rx, l, re.I)]
+        if hits:
+            row("!", f"log: {name}", f"{len(hits)}x since boot ({meaning}); last: {hits[-1].strip()[:150]}")
+        elif log:
+            row("ok", f"log: {name}", "none since boot")
+
+    w = max(len(r[1]) for r in rows)
+    for mark, what, text in rows:
+        print(f"  {mark:<4} {what:<{w}}  {text}")
+    bad = sum(1 for r in rows if r[0] == "!")
+    print(f"\n{bad} thing(s) worth a look." if bad else "\nNothing suspicious found.")
+
+
+# --------------------------------------------------------------------------
+# Freeze recorder: short (tens of ms) stalls that are too brief for the
+# guards above. A normal-priority loop wakes every few ms; when it was held
+# up for longer than the threshold, the counters recorded just before and
+# right after the gap say who was waiting for what.
+
+VMSTAT_KEYS = ("allocstall", "compact_stall", "pgscan_direct", "pgmajfault", "pswpin",
+               "workingset_refault_anon", "workingset_refault_file", "thp_fault_fallback",
+               "oom_kill", "lru_drain_timeout")
+PSI_KINDS = ("cpu", "memory", "io", "irq")
+
+
+def read_psi():
+    """{"memory some": total_us, "memory full": ..., ...}"""
+    out = {}
+    for kind in PSI_KINDS:
+        for line in (read(f"/proc/pressure/{kind}") or "").splitlines():
+            f = line.split()
+            if f and f[-1].startswith("total="):
+                out[f"{kind} {f[0]}"] = int(f[-1][6:])
+    return out
+
+
+def read_vmstat():
+    out = dict.fromkeys(VMSTAT_KEYS, 0)
+    for line in (read("/proc/vmstat") or "").splitlines():
+        k, _, v = line.partition(" ")
+        if k.startswith("allocstall_"):
+            out["allocstall"] += int(v)
+        elif k in out:
+            out[k] = int(v)
+    return out
+
+
+def read_interrupt_totals():
+    """{key: (total over all CPUs, name)} including LOC, TLB, CAL, NMI, ..."""
+    text = read("/proc/interrupts", "")
+    lines = text.splitlines()
+    if not lines:
+        return {}
+    ncpu = len(lines[0].split())
+    out = {}
+    for line in lines[1:]:
+        head, _, rest = line.partition(":")
+        f = rest.split()
+        total, n = 0, 0
+        for x in f[:ncpu]:
+            if not x.isdigit():
+                break
+            total += int(x)
+            n += 1
+        out[head.strip()] = (total, " ".join(f[n:])[-40:])
+    return out
+
+
+class Snapshot:
+    __slots__ = ("t", "wall", "psi", "vm", "irq", "smi")
+    counter = None  # SmiCounter shared by all snapshots, set by freeze_watch()
+
+    def __init__(self):
+        self.t = time.monotonic()
+        self.wall = time.time()
+        self.psi = read_psi()
+        self.vm = read_vmstat()
+        self.irq = read_interrupt_totals()
+        c = Snapshot.counter
+        self.smi = c.read() if c is not None and c.available else None
+
+
+def explain(a, b, gap_ms):
+    """Describe what happened between snapshots @a and @b."""
+    dt = max(b.t - a.t, 1e-3)
+    psi = {k: (b.psi[k] - a.psi.get(k, b.psi[k])) / 1000.0 for k in b.psi}  # ms
+    vm = {k: b.vm[k] - a.vm[k] for k in b.vm if b.vm[k] - a.vm[k] > 0}
+    irqs = []
+    for k, (tot, name) in b.irq.items():
+        old = a.irq.get(k)
+        if old and tot > old[0]:
+            irqs.append(((tot - old[0]) / dt, k, name))
+    irqs.sort(reverse=True)
+
+    def ms(k):
+        return psi.get(k, 0.0)
+
+    lines = ["   psi (ms stalled in this window): " + "  ".join(
+        f"{k} {ms(k):.0f}" for k in ("memory some", "memory full", "io some", "io full",
+                                     "cpu some", "irq full") if k in psi)]
+    if vm:
+        lines.append("   vmstat: " + ", ".join(f"{k} +{v}" for k, v in vm.items()))
+    smi = None
+    if getattr(a, "smi", None) is not None and getattr(b, "smi", None) is not None:
+        smi = b.smi - a.smi
+        lines.append(f"   SMIs (firmware interrupts): {smi}")
+    lines.append("   busiest interrupts: " + ", ".join(
+        f"{k} {r:.0f}/s{(' (' + n + ')') if n and not k.isalpha() else ''}" for r, k, n in irqs[:4]))
+
+    if smi:
+        verdict = (f"FIRMWARE: {smi} SMI(s) during this window; the firmware stopped the system "
+                   "(BIOS update; on AMD check the fTPM, see 'devguard check')")
+    elif max(ms("memory some"), ms("memory full")) >= 0.4 * gap_ms or vm.get("allocstall") or vm.get("compact_stall"):
+        verdict = ("MEMORY: tasks stalled in reclaim/compaction (allocstall/compact_stall); "
+                   "memstall.bt shows which process and allocation")
+    elif ms("irq full") >= 0.3 * gap_ms:
+        verdict = f"INTERRUPTS: CPUs busy in interrupt handlers, busiest line {irqs[0][1] if irqs else '?'}"
+    elif max(ms("io some"), ms("io full")) >= 0.4 * gap_ms:
+        verdict = ("I/O: tasks waited for the disk" +
+                   (" (major faults / swap-in: evicted pages read back)" if vm.get("pgmajfault") or vm.get("pswpin") else ""))
+    elif ms("cpu some") >= 0.4 * gap_ms:
+        verdict = "CPU: runnable tasks waited for a CPU (something else hogged them)"
+    else:
+        verdict = ("UNACCOUNTED: no CPU/memory/I/O/IRQ pressure recorded. Suspects: firmware "
+                   "(SMI" + ("" if smi is not None else ", not countable here") +
+                   "), a long interrupts-off section in a driver, or a kernel lock")
+    return verdict, lines
+
+
+def freeze_watch(threshold_ms, seconds=None, tick_ms=5, snap_ms=100):
+    kmsg = KmsgGuard(dict(DEFAULTS["kmsg"], quiet_console=False), Actions(False))
+    hist = collections.deque(maxlen=int(5000 / snap_ms))  # last 5 s of snapshots
+    gaps = collections.deque(maxlen=100)                   # (wall, ms)
+    interactive = sys.stdin.isatty()
+    Snapshot.counter = SmiCounter()
+    print(f"devguard freeze: watching for stalls > {threshold_ms} ms "
+          f"(checking every {tick_ms} ms).", flush=True)
+    print("SMI counting: " + ("on" if Snapshot.counter.available else f"off ({Snapshot.counter.why})"),
+          flush=True)
+    if interactive:
+        print("Press Enter when you see a freeze the watcher did not catch "
+              "(e.g. only the picture froze). Ctrl+C to stop.", flush=True)
+    stop = []
+    signal.signal(signal.SIGINT, lambda *_: stop.append(1))
+    signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
+    hist.append(Snapshot())
+    start = last = time.monotonic()
+    found = 0
+    while not stop:
+        fds = [sys.stdin] if interactive else []
+        if kmsg.fd is not None:
+            fds.append(kmsg.fd)
+        try:
+            r, _, _ = select.select(fds, [], [], tick_ms / 1000.0)
+        except InterruptedError:
+            continue
+        now = time.monotonic()
+        if kmsg.fd is not None and kmsg.fd in r:
+            kmsg.readable()
+        gap = (now - last) * 1000.0
+        last = now
+        if seconds is not None and now - start >= seconds:
+            break
+        if gap - tick_ms >= threshold_ms and gap < 10000:
+            found += 1
+            before = hist[-1]
+            after = Snapshot()
+            hist.append(after)
+            gaps.append((after.wall, gap))
+            verdict, lines = explain(before, after, gap)
+            stamp = time.strftime("%H:%M:%S", time.localtime(after.wall)) + f".{int(after.wall * 1000) % 1000:03d}"
+            print(f"\n{stamp}  FREEZE {gap:.0f} ms (this watcher was held up)\n   -> {verdict}", flush=True)
+            print("\n".join(lines), flush=True)
+            for t, msg in kmsg.recent:
+                if t >= before.t - 1:
+                    print(f"   kernel: {msg}", flush=True)
+            continue
+        if interactive and sys.stdin in r:
+            sys.stdin.readline()
+            now_snap = Snapshot()
+            hist.append(now_snap)
+            window = [s for s in hist if s.t >= now_snap.t - 3]
+            recent_gaps = [g for w, g in gaps if w >= now_snap.wall - 3]
+            print(f"\n{time.strftime('%H:%M:%S')}  MARK: last 3 s", flush=True)
+            if recent_gaps:
+                print(f"   the watcher itself stalled {len(recent_gaps)}x "
+                      f"(max {max(recent_gaps):.0f} ms), see FREEZE lines above", flush=True)
+            else:
+                print("   the CPU side ran normally (no stall of this watcher): the freeze was "
+                      "probably in the GPU/display path (driver, compositor, VRR/refresh switch)", flush=True)
+            verdict, lines = explain(window[0], now_snap, 3000)
+            print("\n".join(lines), flush=True)
+            for t, msg in kmsg.recent:
+                if t >= now_snap.t - 3:
+                    print(f"   kernel: {msg}", flush=True)
+            continue
+        if (now - hist[-1].t) * 1000.0 >= snap_ms:
+            hist.append(Snapshot())
+    print(f"\n{found} freeze(s) > {threshold_ms} ms seen in {time.monotonic() - start:.0f} s", flush=True)
 
 
 def run(cfg, seconds=None, summary=False):
@@ -844,12 +1238,16 @@ def status():
 
 def main():
     ap = argparse.ArgumentParser(prog="devguard", description=__doc__.split("\n")[0])
-    ap.add_argument("command", nargs="?", default="run", choices=["run", "status", "revert", "scan"])
+    ap.add_argument("command", nargs="?", default="run",
+                    choices=["run", "status", "revert", "scan", "freeze", "check"])
     ap.add_argument("--config", default="/etc/devguard.toml")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--enforce", action="store_true", help="act, regardless of the config")
     g.add_argument("--observe", action="store_true", help="only log, regardless of the config")
-    ap.add_argument("--seconds", type=float, default=30, help="duration of 'scan'")
+    ap.add_argument("--seconds", type=float, default=None,
+                    help="duration of 'scan' (default 30) or 'freeze' (default: until Ctrl+C)")
+    ap.add_argument("--threshold", type=float, default=30,
+                    help="'freeze': report stalls longer than this many ms (default 30)")
     a = ap.parse_args()
 
     if a.command == "status":
@@ -865,11 +1263,15 @@ def main():
         cfg["mode"] = "enforce"
     if a.observe or a.command == "scan":
         cfg["mode"] = "observe"
+    if a.command == "check":
+        return check()
+    if a.command == "freeze":  # works without root, just without kernel messages
+        return freeze_watch(a.threshold, a.seconds)
     if os.geteuid() != 0 and not ROOT:
         print("devguard: needs root (reads /dev/kmsg, writes /proc/irq and sysfs)", file=sys.stderr)
         return 1
     if a.command == "scan":
-        return run(cfg, seconds=a.seconds, summary=True)
+        return run(cfg, seconds=a.seconds if a.seconds is not None else 30, summary=True)
     return run(cfg)
 
 
