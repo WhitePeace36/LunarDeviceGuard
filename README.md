@@ -21,7 +21,8 @@ not the work. That is the gap devguard fills.
 Arch / CachyOS:
 
 ```bash
-cd devguard
+git clone https://github.com/WhitePeace36/LunarDeviceGuard.git
+cd LunarDeviceGuard
 makepkg -si
 sudo systemctl enable --now devguard
 journalctl -u devguard -f
@@ -76,4 +77,4 @@ Or set `revert_on_exit = true` to undo everything when the service stops.
 
 `python3 tests/test_devguard.py` runs devguard against fake `/proc` and `/sys`
 trees with simulated storms, error floods, reconnect loops and log floods
-(38 checks, no root needed).
+(43 checks, no root needed).

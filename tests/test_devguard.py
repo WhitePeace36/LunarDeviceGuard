@@ -404,6 +404,39 @@ def test_kmsg():
     check(get("/proc/sys/kernel/printk").split()[0] == "7", "revert restores the loglevel")
 
 
+def test_kmsg_proc_fallback():
+    print("kernel log floods via /proc/kmsg (printk_devkmsg=off)")
+    reset_state()
+    put("/proc/sys/kernel/printk", "7\t4\t1\t7\n")
+    put("/proc/sys/kernel/printk_devkmsg", "off\n")
+    if os.path.exists(ROOT + "/dev/kmsg"):
+        os.remove(ROOT + "/dev/kmsg")
+    # boot backlog that must not count as a flood
+    put("/proc/kmsg", "".join(f"<6>[    0.{i:06d}] boot message {i}\n" for i in range(5000)))
+    acts = dg.Actions(enforce=True)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        g = dg.KmsgGuard(cfg("kmsg"), acts)
+    check(g.source == "/proc/kmsg", "falls back to /proc/kmsg")
+    check("printk_devkmsg = off" in out.getvalue(), "explains why /dev/kmsg was not used")
+    g.readable()
+    out.write(captured(g.tick, 1.0))
+    check("flood" not in out.getvalue(), "boot backlog is skipped, not counted")
+    with open(ROOT + "/proc/kmsg", "a") as f:
+        for sec in range(6):
+            for i in range(120):
+                f.write(f"<3>[  {100 + sec}.{i:06d}] usb 3-2: device descriptor read/64, error -71\n")
+            f.flush()
+            g.readable()
+            out.write(captured(g.tick, 1.0))
+    text = out.getvalue()
+    check("120 kernel log lines/s" in text and "usb #-#: device descriptor read/#, error -#" in text,
+          "flood detected and grouped from /proc/kmsg lines")
+    check(get("/proc/sys/kernel/printk").split()[0] == "3", "console loglevel lowered")
+    captured(acts.revert)
+    os.remove(ROOT + "/proc/kmsg")
+
+
 def test_run_loop():
     print("service loop")
     reset_state()
@@ -456,6 +489,7 @@ if __name__ == "__main__":
         test_aer()
         test_usb()
         test_kmsg()
+        test_kmsg_proc_fallback()
         test_run_loop()
         test_config()
     finally:

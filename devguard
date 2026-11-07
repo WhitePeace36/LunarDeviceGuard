@@ -664,6 +664,7 @@ class UsbGuard:
 # numbers, hex numbers and PCI/USB addresses in log messages, so that the
 # same message from different devices or with different values groups
 NUMBER = re.compile(r"\b(?:0x)?[0-9a-fA-F]*[0-9][0-9a-fA-F]*\b")
+PROC_KMSG_PREFIX = re.compile(r"^<\d+>(?:\[\s*[\d.]+\]\s*)?")
 
 
 class KmsgGuard:
@@ -677,15 +678,41 @@ class KmsgGuard:
         self.quieted = False
         self.partial = ""
         self.findings = []
+        self.source = None
+        # /dev/kmsg is refused, even to root, when kernel.printk_devkmsg is
+        # "off" (or printk.devkmsg=off on the command line). /proc/kmsg, the
+        # older syslog interface, still works then, like dmesg's fallback.
         try:
             self.fd = os.open(path("/dev/kmsg"), os.O_RDONLY | os.O_NONBLOCK)
-        except OSError as e:
-            log(f"warning: can't read /dev/kmsg ({e.strerror}); log flood detection disabled")
+            self.source = "/dev/kmsg"
+            try:
+                os.lseek(self.fd, 0, os.SEEK_END)  # skip the boot log
+            except OSError:
+                pass
             return
+        except OSError as e:
+            why = e.strerror
+            if (read("/proc/sys/kernel/printk_devkmsg") or "").strip() == "off":
+                why += ", kernel.printk_devkmsg = off"
         try:
-            os.lseek(self.fd, 0, os.SEEK_END)  # skip the boot log
-        except OSError:
-            pass
+            self.fd = os.open(path("/proc/kmsg"), os.O_RDONLY | os.O_NONBLOCK)
+        except OSError as e:
+            log(f"warning: can't read /dev/kmsg ({why}) or /proc/kmsg ({e.strerror}); "
+                "log flood detection disabled")
+            return
+        self.source = "/proc/kmsg"
+        self._drain_backlog()
+        log(f"note: reading the kernel log from /proc/kmsg (/dev/kmsg: {why}). "
+            "A syslog daemon that also reads /proc/kmsg would miss messages.")
+
+    def _drain_backlog(self):
+        """/proc/kmsg starts with everything not yet read since boot; drop it."""
+        for _ in range(10000):
+            try:
+                if not os.read(self.fd, 65536):
+                    return
+            except OSError:
+                return
 
     def readable(self):
         while True:
@@ -694,13 +721,14 @@ class KmsgGuard:
             except BlockingIOError:
                 return
             except OSError as e:
-                if e.errno == errno.EPIPE:  # records were overwritten, keep going
-                    continue
+                if e.errno == errno.EPIPE and self.source == "/dev/kmsg":
+                    continue  # records were overwritten, keep going
                 return
             if not rec:
                 return
-            # one record per read from /dev/kmsg: "prio,seq,ts,flags;text\n"
-            # followed by optional " KEY=value" dictionary lines
+            # /dev/kmsg: one record per read, "prio,seq,ts,flags;text\n"
+            # followed by optional " KEY=value" dictionary lines.
+            # /proc/kmsg: "<prio>[ seconds] text\n" lines.
             text = self.partial + rec.decode(errors="replace")
             lines = text.split("\n")
             self.partial = lines.pop()  # incomplete last line, if any
@@ -708,7 +736,10 @@ class KmsgGuard:
                 if not line or line.startswith(" "):
                     continue
                 self.count += 1
-                msg = line.split(";", 1)[-1]
+                if self.source == "/dev/kmsg":
+                    msg = line.split(";", 1)[-1]
+                else:
+                    msg = PROC_KMSG_PREFIX.sub("", line)
                 self.top[NUMBER.sub("#", msg)[:70]] += 1
 
     def tick(self, dt):

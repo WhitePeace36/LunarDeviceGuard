@@ -1,6 +1,6 @@
 [Unit]
 Description=devguard - contain IRQ storms, PCIe error floods and USB reconnect loops
-Documentation=https://github.com/WhitePeace36/linux-lunar/tree/main/devguard
+Documentation=https://github.com/WhitePeace36/LunarDeviceGuard
 After=systemd-udevd.service
 
 [Service]
