@@ -1,0 +1,19 @@
+[Unit]
+Description=devguard - contain IRQ storms, PCIe error floods and USB reconnect loops
+Documentation=https://github.com/WhitePeace36/linux-lunar/tree/main/devguard
+After=systemd-udevd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/devguard run --config /etc/devguard.toml
+Restart=on-failure
+RestartSec=5
+# Stays responsive while the system is busy, without competing with games.
+Nice=-5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
+RuntimeDirectory=devguard
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=multi-user.target

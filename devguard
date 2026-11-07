@@ -1,0 +1,846 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
+"""devguard - contain misbehaving hardware before it stalls the whole system.
+
+Watches for
+  * interrupt storms   (one IRQ line eating a CPU)            -> move the IRQ
+                                                                  to a housekeeping CPU
+  * PCIe AER floods    (a link spewing correctable errors)     -> turn off ASPM on
+                                                                  that link, then mask
+                                                                  correctable errors
+  * USB reconnect loops (a device/cable dropping off and on)   -> disable that port
+  * kernel log floods  (a driver printing hundreds of lines/s) -> lower the console
+                                                                  loglevel
+
+Default mode is "observe": it only logs what it would do. Set mode = "enforce"
+in /etc/devguard.toml (or pass --enforce) to let it act. Everything it changes
+is recorded in /run/devguard/state.json and can be undone with
+`devguard revert`.
+
+Usage:
+  devguard run [--enforce|--observe] [--config FILE]   run the service
+  devguard status                                      show recorded actions
+  devguard revert                                      undo recorded actions
+  devguard scan [--seconds N]                          observe for N seconds,
+                                                       print findings, exit
+"""
+
+import argparse
+import collections
+import errno
+import glob
+import json
+import os
+import re
+import select
+import signal
+import socket
+import sys
+import time
+
+try:
+    import tomllib
+except ImportError:  # Python < 3.11
+    tomllib = None
+
+ROOT = os.environ.get("DEVGUARD_ROOT", "")  # test fixtures prefix /proc and /sys
+STATE_FILE = os.environ.get("DEVGUARD_STATE", "/run/devguard/state.json")
+
+DEFAULTS = {
+    "mode": "observe",
+    "interval": 1.0,
+    "revert_on_exit": False,
+    "irq": {
+        "enabled": True,
+        "cpu_percent": 25.0,
+        "min_rate": 2000,
+        "rate_threshold": 100000,
+        "sustain": 3,
+        "housekeeping_cpus": "0",
+        "ignore": [],
+        "unbind_allow": [],
+        "escalate_after": 30,
+    },
+    "aer": {
+        "enabled": True,
+        "correctable_rate": 5.0,
+        "sustain": 5,
+        "disable_aspm": True,
+        "mask_correctable": True,
+        "mask_after": 30,
+        "ignore": [],
+    },
+    "usb": {
+        "enabled": True,
+        "cycles": 8,
+        "window": 60,
+        "reenable_after": 600,
+        "ignore": [],
+    },
+    "kmsg": {
+        "enabled": True,
+        "lines_per_sec": 50,
+        "sustain": 5,
+        "quiet_console": True,
+    },
+}
+
+# PCIe AER correctable error bits (Correctable Error Mask register, AER cap +0x14):
+# receiver error, bad TLP, bad DLLP, replay rollover, replay timeout,
+# advisory non-fatal, corrected internal, header log overflow
+AER_COR_MASK_ALL = 0x0000F1C1
+PCI_EXT_CAP_ID_ERR = 0x0001
+AER_COR_MASK_OFF = 0x14
+
+
+def path(p):
+    return ROOT + p
+
+
+def read(p, default=None):
+    try:
+        with open(path(p)) as f:
+            return f.read()
+    except OSError:
+        return default
+
+
+def write(p, value):
+    with open(path(p), "w") as f:
+        f.write(str(value))
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def deep_merge(base, over):
+    out = dict(base)
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config(file):
+    cfg = DEFAULTS
+    if file and os.path.exists(file):
+        if tomllib is None:
+            log(f"warning: Python has no tomllib, ignoring {file}")
+        else:
+            with open(file, "rb") as f:
+                cfg = deep_merge(DEFAULTS, tomllib.load(f))
+    if cfg["mode"] not in ("observe", "enforce"):
+        raise SystemExit(f"devguard: mode must be observe or enforce, not {cfg['mode']!r}")
+    return cfg
+
+
+def parse_cpulist(s):
+    cpus = set()
+    for part in s.strip().split(","):
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-")
+            cpus.update(range(int(a), int(b) + 1))
+        else:
+            cpus.add(int(part))
+    return cpus
+
+
+# --------------------------------------------------------------------------
+# Actions and their undo records
+
+
+class Actions:
+    """Performs (or, in observe mode, announces) changes and records them."""
+
+    def __init__(self, enforce):
+        self.enforce = enforce
+        self.records = self._load()
+
+    @staticmethod
+    def _load():
+        try:
+            with open(STATE_FILE) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return []
+
+    def _save(self):
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.records, f, indent=1)
+        os.replace(tmp, STATE_FILE)
+
+    def change(self, what, file, new, why, kind, key):
+        """Write @new to @file, remembering the old value for revert.
+
+        Returns True if the change was made (enforce mode and the write
+        succeeded)."""
+        old = read(file)
+        old = old.strip() if old is not None else None
+        if not self.enforce:
+            log(f"[observe] would {what} ({why})")
+            return False
+        try:
+            write(file, new)
+        except OSError as e:
+            hint = ""
+            if e.errno == errno.EIO and "/proc/irq/" in file:
+                hint = " (kernel-managed IRQ, its affinity can't be changed)"
+            log(f"[enforce] failed to {what}: {e.strerror}{hint}")
+            return False
+        log(f"[enforce] {what} ({why})")
+        if old is not None:
+            self.records.append({"time": time.time(), "kind": kind, "key": key,
+                                 "file": file, "old": old, "new": str(new),
+                                 "what": what, "why": why})
+            self._save()
+        return True
+
+    def config_write(self, dev, offset, value, old, what, why, key):
+        """Write a dword to PCI config space of @dev."""
+        if not self.enforce:
+            log(f"[observe] would {what} ({why})")
+            return False
+        try:
+            pci_cfg_write32(dev, offset, value)
+        except OSError as e:
+            log(f"[enforce] failed to {what}: {e.strerror}")
+            return False
+        log(f"[enforce] {what} ({why})")
+        self.records.append({"time": time.time(), "kind": "pci_config", "key": key,
+                             "dev": dev, "offset": offset, "old": old, "new": value,
+                             "what": what, "why": why})
+        self._save()
+        return True
+
+    def forget(self, key):
+        self.records = [r for r in self.records if r["key"] != key]
+        if self.enforce:
+            self._save()
+
+    def revert(self, key=None):
+        keep = []
+        for r in reversed(self.records):
+            if key is not None and r["key"] != key:
+                keep.append(r)
+                continue
+            try:
+                if r["kind"] == "pci_config":
+                    pci_cfg_write32(r["dev"], r["offset"], r["old"])
+                else:
+                    write(r["file"], r["old"])
+                log(f"reverted: {r['what']}")
+            except OSError as e:
+                log(f"could not revert '{r['what']}': {e.strerror}")
+        self.records = list(reversed(keep))
+        self._save()
+
+
+# --------------------------------------------------------------------------
+# PCI helpers
+
+
+def pci_name(dev):
+    drv = os.path.basename(os.path.realpath(path(f"/sys/bus/pci/devices/{dev}/driver"))) \
+        if os.path.exists(path(f"/sys/bus/pci/devices/{dev}/driver")) else "no driver"
+    ven = (read(f"/sys/bus/pci/devices/{dev}/vendor") or "?").strip().replace("0x", "")
+    did = (read(f"/sys/bus/pci/devices/{dev}/device") or "?").strip().replace("0x", "")
+    return f"{dev} [{ven}:{did} {drv}]"
+
+
+def pci_cfg_read32(dev, off):
+    with open(path(f"/sys/bus/pci/devices/{dev}/config"), "rb") as f:
+        f.seek(off)
+        b = f.read(4)
+    if len(b) != 4:
+        raise OSError(errno.EIO, "short config read")
+    return int.from_bytes(b, "little")
+
+
+def pci_cfg_write32(dev, off, val):
+    with open(path(f"/sys/bus/pci/devices/{dev}/config"), "r+b") as f:
+        f.seek(off)
+        f.write(int(val).to_bytes(4, "little"))
+
+
+def pci_find_ext_cap(dev, cap_id):
+    off, seen = 0x100, 0
+    while off and seen < 64:
+        try:
+            hdr = pci_cfg_read32(dev, off)
+        except OSError:
+            return None
+        if hdr in (0, 0xFFFFFFFF):
+            return None
+        if hdr & 0xFFFF == cap_id:
+            return off
+        off = (hdr >> 20) & 0xFFC
+        seen += 1
+    return None
+
+
+def irq_to_pci():
+    """Map IRQ number -> PCI address via msi_irqs/ and legacy irq files."""
+    m = {}
+    for d in glob.glob(path("/sys/bus/pci/devices/*")):
+        dev = os.path.basename(d)
+        for irq in glob.glob(d + "/msi_irqs/*"):
+            try:
+                m[int(os.path.basename(irq))] = dev
+            except ValueError:
+                pass
+        legacy = read(f"/sys/bus/pci/devices/{dev}/irq")
+        if legacy and legacy.strip().isdigit() and int(legacy) > 0:
+            m.setdefault(int(legacy), dev)
+    return m
+
+
+# --------------------------------------------------------------------------
+# Interrupt storms
+
+
+def read_interrupts():
+    """Return (cpu ids of columns, {irq: (per-cpu counts, name)})."""
+    text = read("/proc/interrupts", "")
+    lines = text.splitlines()
+    if not lines:
+        return [], {}
+    cpus = [int(c[3:]) for c in lines[0].split()]
+    out = {}
+    for line in lines[1:]:
+        head, _, rest = line.partition(":")
+        head = head.strip()
+        if not head.isdigit():
+            continue  # LOC, TLB, ... are per-CPU system vectors, not devices
+        fields = rest.split()
+        counts = []
+        for f in fields[:len(cpus)]:
+            if not f.isdigit():
+                break
+            counts.append(int(f))
+        name = " ".join(fields[len(counts):])
+        out[int(head)] = (counts, name)
+    return cpus, out
+
+
+def read_cpu_irq_time():
+    """Return {cpu: (total jiffies, irq+softirq jiffies)} from /proc/stat."""
+    out = {}
+    for line in read("/proc/stat", "").splitlines():
+        if line.startswith("cpu") and line[3:4].isdigit():
+            f = line.split()
+            vals = [int(x) for x in f[1:]]
+            # user nice system idle iowait irq softirq steal guest guest_nice
+            total = sum(vals[:8])
+            out[int(f[0][3:])] = (total, vals[5] + vals[6])
+    return out
+
+
+class IrqGuard:
+    def __init__(self, cfg, actions):
+        self.cfg = cfg
+        self.actions = actions
+        self.prev = None
+        self.streak = collections.Counter()
+        self.handled = {}  # irq -> start of the current storm episode
+        self.last_hit = {}  # irq -> last sample it was storming
+        self.escalated = set()
+        self.pci = {}
+        self.pci_time = None
+        self.ignore = [re.compile(r) for r in cfg["ignore"]]
+        self.housekeeping = cfg["housekeeping_cpus"]
+        self.findings = []
+
+    def sample(self, now):
+        cpus, irqs = read_interrupts()
+        cur = (now, cpus, irqs, read_cpu_irq_time())
+        prev, self.prev = self.prev, cur
+        if prev is None:
+            return
+        if self.pci_time is None or now - self.pci_time > 60:
+            self.pci, self.pci_time = irq_to_pci(), now
+        self._check(prev, cur)
+
+    def _check(self, prev, cur):
+        t0, cpus0, irqs0, stat0 = prev
+        t1, cpus1, irqs1, stat1 = cur
+        dt = t1 - t0
+        if dt <= 0 or cpus0 != cpus1:
+            return
+        cfg = self.cfg
+        hits = {}
+
+        # per-CPU device interrupt deltas
+        per_cpu = collections.defaultdict(dict)
+        rate = {}
+        for irq, (counts, _name) in irqs1.items():
+            old = irqs0.get(irq)
+            if not old or len(old[0]) != len(counts):
+                continue
+            deltas = [max(0, c - o) for c, o in zip(counts, old[0])]
+            rate[irq] = sum(deltas) / dt
+            for col, d in enumerate(deltas):
+                if d:
+                    per_cpu[cpus1[col]][irq] = d
+
+        # rule 1: a CPU spends cpu_percent of its time in (soft)irq and one
+        # IRQ line dominates that CPU's device interrupts
+        for cpu, (tot1, irqt1) in stat1.items():
+            tot0, irqt0 = stat0.get(cpu, (tot1, irqt1))
+            dtot = tot1 - tot0
+            if dtot <= 0:
+                continue
+            share = 100.0 * (irqt1 - irqt0) / dtot
+            if share < cfg["cpu_percent"] or not per_cpu.get(cpu):
+                continue
+            irq, d = max(per_cpu[cpu].items(), key=lambda kv: kv[1])
+            if d / dt >= cfg["min_rate"] and d >= 0.5 * sum(per_cpu[cpu].values()):
+                hits[irq] = f"CPU{cpu} {share:.0f}% in irq, IRQ {irq} at {d / dt:.0f}/s on it"
+
+        # rule 2: absolute rate, independent of CPU time accounting
+        for irq, r in rate.items():
+            if r >= cfg["rate_threshold"] and irq not in hits:
+                hits[irq] = f"{r:.0f} interrupts/s"
+
+        for irq in list(self.streak):
+            if irq not in hits:
+                del self.streak[irq]
+        for irq, why in hits.items():
+            name = irqs1[irq][1]
+            if any(p.search(name) for p in self.ignore):
+                continue
+            self.streak[irq] += 1
+            quiet_since = self.last_hit.get(irq)
+            self.last_hit[irq] = t1
+            if quiet_since is not None and t1 - quiet_since > 60:
+                # a new storm long after the last one: start over
+                self.handled.pop(irq, None)
+                self.escalated.discard(irq)
+            if self.streak[irq] >= cfg["sustain"]:
+                self._act(irq, name, why, t1)
+
+    def _describe(self, irq, name):
+        dev = self.pci.get(irq)
+        return f"IRQ {irq} ({name}{', ' + pci_name(dev) if dev else ''})"
+
+    def _act(self, irq, name, why, now):
+        desc = self._describe(irq, name)
+        first = self.handled.get(irq)
+        if first is None:
+            self.handled[irq] = now
+            self.findings.append(f"interrupt storm: {desc}: {why}")
+            cur = (read(f"/proc/irq/{irq}/smp_affinity_list") or "").strip()
+            if cur and parse_cpulist(cur) == parse_cpulist(self.housekeeping):
+                log(f"interrupt storm on {desc}: {why}; already confined to CPU {cur}")
+                return
+            self.actions.change(f"move {desc} from CPU {cur or '?'} to CPU {self.housekeeping}",
+                                f"/proc/irq/{irq}/smp_affinity_list", self.housekeeping,
+                                why, "irq_affinity", f"irq:{irq}")
+            return
+        if now - first < self.cfg["escalate_after"] or irq in self.escalated:
+            return
+        self.escalated.add(irq)
+        dev = self.pci.get(irq)
+        if dev and dev in self.cfg["unbind_allow"]:
+            self.actions.change(f"unbind driver of {pci_name(dev)}",
+                                f"/sys/bus/pci/devices/{dev}/driver/unbind", dev,
+                                f"storm continued for {now - first:.0f}s: {why}",
+                                "unbind", f"unbind:{dev}")
+        else:
+            log(f"interrupt storm on {desc} continues after {now - first:.0f}s ({why}). "
+                f"{'Add ' + dev + ' to irq.unbind_allow to let devguard unbind its driver.' if dev else ''}")
+
+
+# --------------------------------------------------------------------------
+# PCIe AER floods
+
+
+def read_aer(dev):
+    out = {}
+    for kind in ("correctable", "nonfatal", "fatal"):
+        text = read(f"/sys/bus/pci/devices/{dev}/aer_dev_{kind}")
+        if text is None:
+            continue
+        m = re.search(r"TOTAL_ERR_\w+\s+(\d+)", text)
+        if m:
+            out[kind] = int(m.group(1))
+    return out
+
+
+ASPM_FILES = ("l1_2_pcipm", "l1_1_pcipm", "l1_2_aspm", "l1_1_aspm", "l1_aspm", "l0s_aspm")
+
+
+class AerGuard:
+    def __init__(self, cfg, actions):
+        self.cfg = cfg
+        self.actions = actions
+        self.prev = {}
+        self.prev_t = None
+        self.streak = collections.Counter()
+        self.stage = {}  # dev -> (stage, time)
+        self.findings = []
+
+    def sample(self, now):
+        cur = {}
+        for d in glob.glob(path("/sys/bus/pci/devices/*")):
+            dev = os.path.basename(d)
+            if dev in self.cfg["ignore"]:
+                continue
+            c = read_aer(dev)
+            if c:
+                cur[dev] = c
+        prev, prev_t = self.prev, self.prev_t
+        self.prev, self.prev_t = cur, now
+        if prev_t is None:
+            return
+        dt = now - prev_t
+        if dt <= 0:
+            return
+        for dev, c in cur.items():
+            p = prev.get(dev)
+            if not p:
+                continue
+            for kind in ("nonfatal", "fatal"):
+                if c.get(kind, 0) > p.get(kind, 0):
+                    log(f"PCIe {kind} errors on {pci_name(dev)}: +{c[kind] - p[kind]}")
+            r = (c.get("correctable", 0) - p.get("correctable", 0)) / dt
+            if r >= self.cfg["correctable_rate"]:
+                self.streak[dev] += 1
+                if self.streak[dev] >= self.cfg["sustain"]:
+                    self._act(dev, r, now)
+            else:
+                self.streak.pop(dev, None)
+
+    def _link_devices(self, dev):
+        """Devices whose link/ attributes control the link @dev reports on."""
+        if os.path.isdir(path(f"/sys/bus/pci/devices/{dev}/link")):
+            return [dev]
+        # a bridge/root port: its downstream link is controlled from the child
+        kids = []
+        for d in glob.glob(path(f"/sys/bus/pci/devices/{dev}/0000:*")):
+            kid = os.path.basename(d)
+            if os.path.isdir(path(f"/sys/bus/pci/devices/{kid}/link")):
+                kids.append(kid)
+        return kids
+
+    def _act(self, dev, r, now):
+        why = f"{r:.0f} correctable PCIe errors/s"
+        stage, since = self.stage.get(dev, (0, now))
+        if stage == 0:
+            self.stage[dev] = (1, now)
+            self.findings.append(f"AER flood: {pci_name(dev)}: {why}")
+            log(f"PCIe error flood on {pci_name(dev)}: {why}")
+            if self.cfg["disable_aspm"]:
+                done_any = False
+                for ld in self._link_devices(dev):
+                    for f in ASPM_FILES:
+                        p = f"/sys/bus/pci/devices/{ld}/link/{f}"
+                        if (read(p) or "").strip() == "1":
+                            self.actions.change(f"disable {f} on the link of {ld}", p, 0,
+                                                why, "aspm", f"aspm:{ld}:{f}")
+                            done_any = True
+                if not done_any:
+                    log(f"  no ASPM state to turn off for {dev} (already off, or "
+                        "ASPM is controlled by the firmware)")
+            return
+        if stage == 1 and self.cfg["mask_correctable"] and now - since >= self.cfg["mask_after"]:
+            self.stage[dev] = (2, now)
+            cap = pci_find_ext_cap(dev, PCI_EXT_CAP_ID_ERR)
+            if cap is None:
+                log(f"  {dev}: no AER capability found, can't mask")
+                return
+            off = cap + AER_COR_MASK_OFF
+            old = pci_cfg_read32(dev, off)
+            new = old | AER_COR_MASK_ALL
+            if new == old:
+                return
+            self.actions.config_write(dev, off, new, old,
+                                      f"mask correctable AER errors on {pci_name(dev)} "
+                                      f"(mask {old:#010x} -> {new:#010x})",
+                                      f"flood continued {now - since:.0f}s after the first step: {why}",
+                                      f"aermask:{dev}")
+
+
+# --------------------------------------------------------------------------
+# USB reconnect loops
+
+
+def open_uevent_socket():
+    try:
+        s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 15)  # NETLINK_KOBJECT_UEVENT
+        s.bind((0, 1))
+        s.setblocking(False)
+        return s
+    except OSError as e:
+        log(f"warning: can't listen for uevents ({e.strerror}); USB loop detection disabled")
+        return None
+
+
+def parse_uevent(data):
+    parts = data.split(b"\0")
+    env = {}
+    for p in parts[1:]:
+        k, sep, v = p.partition(b"=")
+        if sep:
+            env[k.decode(errors="replace")] = v.decode(errors="replace")
+    return env
+
+
+class UsbGuard:
+    def __init__(self, cfg, actions):
+        self.cfg = cfg
+        self.actions = actions
+        self.events = collections.defaultdict(collections.deque)
+        self.ports = {}       # DEVPATH -> port sysfs path
+        self.ids = {}         # DEVPATH -> vid:pid
+        self.disabled = {}    # port -> time
+        self.findings = []
+
+    def event(self, env, now):
+        if env.get("SUBSYSTEM") != "usb" or env.get("DEVTYPE") != "usb_device":
+            return
+        devpath = env.get("DEVPATH", "")
+        action = env.get("ACTION")
+        name = os.path.basename(devpath)
+        if action == "add":
+            port = os.path.realpath(path(f"/sys{devpath}/port"))
+            if os.path.exists(port):
+                self.ports[devpath] = port[len(ROOT):] if ROOT else port
+            prod = env.get("PRODUCT", "")
+            if prod.count("/") >= 2:
+                vid, pid, _ = prod.split("/", 2)
+                self.ids[devpath] = f"{int(vid, 16):04x}:{int(pid, 16):04x}"
+            return
+        if action != "remove":
+            return
+        ident = self.ids.get(devpath, "?")
+        if name in self.cfg["ignore"] or ident in self.cfg["ignore"]:
+            return
+        q = self.events[devpath]
+        q.append(now)
+        while q and now - q[0] > self.cfg["window"]:
+            q.popleft()
+        if len(q) >= self.cfg["cycles"]:
+            q.clear()
+            self._act(devpath, name, ident, now)
+
+    def _act(self, devpath, name, ident, now):
+        why = f"USB device {name} ({ident}) disconnected {self.cfg['cycles']}x within {self.cfg['window']}s"
+        self.findings.append(f"USB reconnect loop: {why}")
+        port = self.ports.get(devpath)
+        if port and os.path.exists(path(port + "/disable")):
+            if self.actions.change(f"disable USB port {os.path.basename(port)}",
+                                   port + "/disable", 1, why, "usb_port", f"usbport:{port}"):
+                self.disabled[port] = now
+            return
+        auth = f"/sys{devpath}/authorized"
+        if os.path.exists(path(auth)):
+            self.actions.change(f"deauthorize USB device {name}", auth, 0, why,
+                                "usb_auth", f"usbauth:{devpath}")
+        else:
+            log(f"{why}; no port 'disable' attribute and the device is gone, nothing to do")
+
+    def tick(self, now):
+        after = self.cfg["reenable_after"]
+        if not after:
+            return
+        for port, t in list(self.disabled.items()):
+            if now - t >= after:
+                del self.disabled[port]
+                log(f"re-enabling USB port {os.path.basename(port)} after {after}s")
+                self.actions.revert(f"usbport:{port}")
+
+
+# --------------------------------------------------------------------------
+# Kernel log floods
+
+
+# numbers, hex numbers and PCI/USB addresses in log messages, so that the
+# same message from different devices or with different values groups
+NUMBER = re.compile(r"\b(?:0x)?[0-9a-fA-F]*[0-9][0-9a-fA-F]*\b")
+
+
+class KmsgGuard:
+    def __init__(self, cfg, actions):
+        self.cfg = cfg
+        self.actions = actions
+        self.fd = None
+        self.count = 0
+        self.top = collections.Counter()
+        self.streak = 0
+        self.quieted = False
+        self.partial = ""
+        self.findings = []
+        try:
+            self.fd = os.open(path("/dev/kmsg"), os.O_RDONLY | os.O_NONBLOCK)
+        except OSError as e:
+            log(f"warning: can't read /dev/kmsg ({e.strerror}); log flood detection disabled")
+            return
+        try:
+            os.lseek(self.fd, 0, os.SEEK_END)  # skip the boot log
+        except OSError:
+            pass
+
+    def readable(self):
+        while True:
+            try:
+                rec = os.read(self.fd, 8192)
+            except BlockingIOError:
+                return
+            except OSError as e:
+                if e.errno == errno.EPIPE:  # records were overwritten, keep going
+                    continue
+                return
+            if not rec:
+                return
+            # one record per read from /dev/kmsg: "prio,seq,ts,flags;text\n"
+            # followed by optional " KEY=value" dictionary lines
+            text = self.partial + rec.decode(errors="replace")
+            lines = text.split("\n")
+            self.partial = lines.pop()  # incomplete last line, if any
+            for line in lines:
+                if not line or line.startswith(" "):
+                    continue
+                self.count += 1
+                msg = line.split(";", 1)[-1]
+                self.top[NUMBER.sub("#", msg)[:70]] += 1
+
+    def tick(self, dt):
+        if dt <= 0:
+            return
+        rate = self.count / dt
+        top = self.top.most_common(1)
+        self.count = 0
+        self.top.clear()
+        if rate < self.cfg["lines_per_sec"]:
+            self.streak = 0
+            return
+        self.streak += 1
+        if self.streak < self.cfg["sustain"] or self.quieted:
+            return
+        self.quieted = True
+        why = f"{rate:.0f} kernel log lines/s, mostly \"{top[0][0] if top else '?'}\""
+        self.findings.append(f"kernel log flood: {why}")
+        log(f"kernel log flood: {why}")
+        if self.cfg["quiet_console"]:
+            levels = (read("/proc/sys/kernel/printk") or "").split()
+            if levels and int(levels[0]) > 3:
+                levels[0] = "3"
+                self.actions.change("lower the console loglevel to 3",
+                                    "/proc/sys/kernel/printk", " ".join(levels),
+                                    why, "printk", "printk")
+
+
+# --------------------------------------------------------------------------
+
+
+def run(cfg, seconds=None, summary=False):
+    enforce = cfg["mode"] == "enforce"
+    actions = Actions(enforce)
+    guards = []
+    irq = IrqGuard(cfg["irq"], actions) if cfg["irq"]["enabled"] else None
+    aer = AerGuard(cfg["aer"], actions) if cfg["aer"]["enabled"] else None
+    usb = UsbGuard(cfg["usb"], actions) if cfg["usb"]["enabled"] else None
+    kmsg = KmsgGuard(cfg["kmsg"], actions) if cfg["kmsg"]["enabled"] else None
+    guards = [g for g in (irq, aer, usb, kmsg) if g]
+    sock = open_uevent_socket() if usb else None
+
+    log(f"devguard running in {cfg['mode']} mode"
+        + ("" if enforce else " (nothing will be changed; set mode = \"enforce\" to act)"))
+    if irq and not os.path.exists(path("/proc/pressure/irq")):
+        log("note: kernel without CONFIG_IRQ_TIME_ACCOUNTING; IRQ CPU time is tick-sampled")
+
+    stop = []
+    signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
+    signal.signal(signal.SIGINT, lambda *_: stop.append(1))
+
+    interval = float(cfg["interval"])
+    start = last = time.monotonic()
+    next_tick = start
+    try:
+        while not stop:
+            now = time.monotonic()
+            if seconds is not None and now - start >= seconds:
+                break
+            if now >= next_tick:
+                if irq:
+                    irq.sample(now)
+                if aer:
+                    aer.sample(now)
+                if usb:
+                    usb.tick(now)
+                if kmsg and kmsg.fd is not None:
+                    kmsg.tick(now - last)
+                last = now
+                next_tick = now + interval
+            fds = [f for f in (sock, kmsg.fd if kmsg else None) if f is not None]
+            try:
+                r, _, _ = select.select(fds, [], [], max(0.0, next_tick - time.monotonic()))
+            except InterruptedError:
+                continue
+            for f in r:
+                if f is sock:
+                    try:
+                        while True:
+                            usb.event(parse_uevent(sock.recv(65536)), time.monotonic())
+                    except BlockingIOError:
+                        pass
+                else:
+                    kmsg.readable()
+    finally:
+        if cfg["revert_on_exit"] and enforce:
+            actions.revert()
+    if summary:
+        found = [f for g in guards for f in g.findings]
+        print("\n".join(found) if found else "no misbehaving devices seen")
+
+
+def status():
+    recs = Actions._load()
+    if not recs:
+        print("no changes recorded")
+        return
+    for r in recs:
+        t = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["time"]))
+        print(f"{t}  {r['what']}\n                     because: {r['why']}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="devguard", description=__doc__.split("\n")[0])
+    ap.add_argument("command", nargs="?", default="run", choices=["run", "status", "revert", "scan"])
+    ap.add_argument("--config", default="/etc/devguard.toml")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--enforce", action="store_true", help="act, regardless of the config")
+    g.add_argument("--observe", action="store_true", help="only log, regardless of the config")
+    ap.add_argument("--seconds", type=float, default=30, help="duration of 'scan'")
+    a = ap.parse_args()
+
+    if a.command == "status":
+        return status()
+    if a.command == "revert":
+        acts = Actions(True)
+        if not acts.records:
+            print("nothing to revert")
+        acts.revert()
+        return
+    cfg = load_config(a.config)
+    if a.enforce:
+        cfg["mode"] = "enforce"
+    if a.observe or a.command == "scan":
+        cfg["mode"] = "observe"
+    if os.geteuid() != 0 and not ROOT:
+        print("devguard: needs root (reads /dev/kmsg, writes /proc/irq and sysfs)", file=sys.stderr)
+        return 1
+    if a.command == "scan":
+        return run(cfg, seconds=a.seconds, summary=True)
+    return run(cfg)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

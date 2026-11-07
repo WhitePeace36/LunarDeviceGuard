@@ -1,0 +1,72 @@
+# devguard configuration (/etc/devguard.toml)
+#
+# "observe": only log what devguard would do (journalctl -u devguard -f).
+# "enforce": actually do it. Start with observe, check the log for false
+# positives on your machine, then switch.
+mode = "observe"
+
+# Seconds between samples of /proc/interrupts, /proc/stat and AER counters.
+interval = 1.0
+
+# Undo every change when the service stops. Otherwise changes stay until
+# reboot or `devguard revert`.
+revert_on_exit = false
+
+[irq]
+# One IRQ line storming a CPU: the CPU spends at least cpu_percent of its
+# time in hard/soft interrupts, and one IRQ fires at least min_rate times
+# per second on it and causes at least half of that CPU's device interrupts.
+enabled = true
+cpu_percent = 25
+min_rate = 2000
+# Any single IRQ above this rate counts as a storm by itself (works without
+# CONFIG_IRQ_TIME_ACCOUNTING). Fast NVMe/NICs can legitimately get close
+# under heavy load, but they use many queues, each below this.
+rate_threshold = 100000
+# Samples in a row before acting.
+sustain = 3
+# Where storming IRQs are moved: a CPU your game doesn't need much.
+# "0" is the usual choice; "15" (the last thread of a 16-thread CPU) works too.
+housekeeping_cpus = "0"
+# Regular expressions matched against the /proc/interrupts name, e.g. "nvme".
+ignore = []
+# PCI addresses (e.g. "0000:0f:00.3") whose driver devguard may unbind when
+# a storm continues escalate_after seconds after the IRQ was moved. Unbinding
+# the driver stops the device completely (for a USB controller: every USB
+# device on it), so only list devices you can live without.
+unbind_allow = []
+escalate_after = 30
+
+[aer]
+# PCIe links reporting correctable errors (bad slot, riser, cable, power
+# saving the device can't handle): first ASPM is turned off on that link,
+# then, if the flood continues for mask_after seconds, correctable errors are
+# masked on the device so they stop raising interrupts.
+enabled = true
+correctable_rate = 5
+sustain = 5
+disable_aspm = true
+mask_correctable = true
+mask_after = 30
+# PCI addresses to leave alone.
+ignore = []
+
+[usb]
+# A device (or cable/port) disconnecting cycles times within window seconds
+# gets its port disabled; after reenable_after seconds the port is enabled
+# again (0 = keep it disabled until `devguard revert` or reboot).
+enabled = true
+cycles = 8
+window = 60
+reenable_after = 600
+# "vid:pid" (e.g. "046d:c52b") or device names (e.g. "3-2") to leave alone.
+ignore = []
+
+[kmsg]
+# More than lines_per_sec kernel log lines per second for sustain seconds:
+# report the most common message and lower the console loglevel to 3, so the
+# text console stops printing them synchronously.
+enabled = true
+lines_per_sec = 50
+sustain = 5
+quiet_console = true
